@@ -22,6 +22,7 @@ from app.models.user import User
 from app.schemas.schemas import (
     GatewayPollResponse, GatewayMessageOut, GatewayReportRequest,
     GatewayHistoryItem, GatewayRelationshipItem, GatewaySendMessageRequest,
+    ToolApprovalRequest, ToolApprovalResponse, ToolApproveRequest, PendingApproval,
 )
 
 router = APIRouter(prefix="/gateway", tags=["gateway"])
@@ -33,23 +34,21 @@ def _hash_key(key: str) -> str:
 
 
 async def _get_agent_by_key(api_key: str, db: AsyncSession) -> Agent:
-    """Authenticate an OpenClaw agent by its API key."""
-    # First try plaintext (new behavior)
+    """Authenticate an OpenClaw agent by its API key (supports both openclaw and native types)."""
+    # First try plaintext (new behavior) — works for both openclaw and native agents
     result = await db.execute(
         select(Agent).where(
             Agent.api_key_hash == api_key,
-            Agent.agent_type == "openclaw",
         )
     )
     agent = result.scalar_one_or_none()
 
-    # Fallback to hashed (legacy behavior)
+    # Fallback to hashed (legacy behavior) — also for both types
     if not agent:
         key_hash = _hash_key(api_key)
         result = await db.execute(
             select(Agent).where(
                 Agent.api_key_hash == key_hash,
-                Agent.agent_type == "openclaw",
             )
         )
         agent = result.scalar_one_or_none()
@@ -82,10 +81,10 @@ async def generate_agent_api_key(agent_id: uuid.UUID, db: AsyncSession = Depends
 
     This is an internal endpoint called by the agents API.
     """
-    result = await db.execute(select(Agent).where(Agent.id == agent_id, Agent.agent_type == "openclaw"))
+    result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = result.scalar_one_or_none()
     if not agent:
-        raise HTTPException(status_code=404, detail="OpenClaw agent not found")
+        raise HTTPException(status_code=404, detail="Agent not found")
 
     # Generate a new key
     raw_key = f"oc-{secrets.token_urlsafe(32)}"
@@ -219,8 +218,29 @@ async def poll_messages(
                 channels=["agent"],
             ))
 
+    # Fetch pending tool approvals for this agent
+    from app.models.audit import ApprovalRequest
+    approvals_result = await db.execute(
+        select(ApprovalRequest)
+        .where(ApprovalRequest.agent_id == agent.id, ApprovalRequest.status == "pending")
+        .order_by(ApprovalRequest.created_at.desc())
+    )
+    pending_approvals = []
+    for apr in approvals_result.scalars().all():
+        details = apr.details or {}
+        pending_approvals.append(PendingApproval(
+            id=apr.id,
+            action_type=apr.action_type,
+            tool=details.get("tool"),
+            args=details.get("args"),
+            reason=details.get("reason"),
+            details=details,
+            created_at=apr.created_at,
+            status=apr.status,
+        ))
+
     await db.commit()
-    return GatewayPollResponse(messages=out, relationships=rel_items)
+    return GatewayPollResponse(messages=out, relationships=rel_items, pending_approvals=pending_approvals)
 
 
 # ─── Report results ─────────────────────────────────────
@@ -319,6 +339,202 @@ async def heartbeat(
     agent.status = "running"
     await db.commit()
     return {"status": "ok", "agent_id": str(agent.id)}
+
+
+# ─── Tool Approval ──────────────────────────────────────
+
+@router.post("/tool-approval", response_model=ToolApprovalResponse)
+async def request_tool_approval(
+    body: ToolApprovalRequest,
+    x_api_key: str = Header(..., alias="X-Api-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """OpenClaw agent requests approval for a dangerous tool operation.
+
+    Creates a pending ApprovalRequest (L3 autonomy level) so the agent creator
+    can review and approve/reject it. The agent should poll /gateway/poll
+    to check for resolution, or wait for notification.
+    """
+    agent = await _get_agent_by_key(x_api_key, db)
+    agent.openclaw_last_seen = datetime.now(timezone.utc)
+
+    from app.models.audit import ApprovalRequest, AuditLog
+
+    # Build details dict with tool info and optional reason
+    details = {
+        "tool": body.tool,
+        "args": body.args,
+        "requested_by": str(agent.creator_id),  # notify the creator (human), not the agent itself
+    }
+    if body.reason:
+        details["reason"] = body.reason
+
+    approval = ApprovalRequest(
+        agent_id=agent.id,
+        action_type=f"tool:{body.tool}",
+        details=details,
+        status="pending",
+    )
+    db.add(approval)
+
+    # Log the request
+    audit = AuditLog(
+        agent_id=agent.id,
+        action="tool_approval_requested",
+        details={"tool": body.tool, "args": body.args, "reason": body.reason},
+    )
+    db.add(audit)
+
+    await db.flush()
+    logger.info(f"[Gateway] tool-approval requested: agent={agent.name}, tool={body.tool}, approval_id={approval.id}")
+
+    # Notify creator via web + Feishu (same as autonomy_service L3 path)
+    await _notify_creator_of_approval(db, agent, approval)
+
+    await db.commit()
+    return ToolApprovalResponse(
+        approval_id=approval.id,
+        status="pending",
+        message=f"Approval requested for tool '{body.tool}'. Check your notifications.",
+    )
+
+
+@router.post("/tool-approve")
+async def approve_tool_request(
+    body: ToolApproveRequest,
+    x_api_key: str = Header(..., alias="X-Api-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve (approve or reject) a pending tool approval request.
+
+    This endpoint is meant to be called by a human (agent creator/admin)
+    or an agent acting on behalf of the creator. It resolves the ApprovalRequest
+    and triggers post-approval execution if approved.
+    """
+    agent = await _get_agent_by_key(x_api_key, db)
+
+    from app.models.audit import ApprovalRequest
+
+    # Load the approval
+    result = await db.execute(
+        select(ApprovalRequest).where(ApprovalRequest.id == body.approval_id)
+    )
+    approval = result.scalar_one_or_none()
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    if approval.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="Approval does not belong to this agent")
+    if approval.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Approval already resolved: {approval.status}")
+
+    # Resolve via autonomy service
+    from app.services.autonomy_service import autonomy_service
+
+    # For gateway tool-approve, we resolve on behalf of the agent itself
+    # (the OpenClaw agent is the one calling this, acting on creator's decision)
+    # We need a User object; use the agent's creator
+    from sqlalchemy import select as sa_select
+    creator_result = await db.execute(sa_select(User).where(User.id == agent.creator_id))
+    creator = creator_result.scalar_one_or_none()
+    if not creator:
+        raise HTTPException(status_code=400, detail="Agent has no creator")
+
+    try:
+        resolved = await autonomy_service.resolve_approval(db, body.approval_id, creator, body.action)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[Gateway] tool-approve failed: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to resolve approval: {str(e)[:100]}")
+
+    try:
+        await db.commit()
+    except Exception as e:
+        logger.error(f"[Gateway] Failed to commit approval: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to save approval result")
+
+    return {
+        "status": "ok",
+        "approval_id": str(resolved.id),
+        "resolution": resolved.status,
+        "message": f"Tool '{approval.action_type}' {resolved.status}.",
+    }
+
+
+async def _notify_creator_of_approval(db: AsyncSession, agent: Agent, approval: "ApprovalRequest") -> None:
+    """Send web + Feishu notification for a pending tool approval (L3 equivalent)."""
+    import json as _json
+    from loguru import logger
+
+    # Web notification — first verify creator exists
+    from app.services.notification_service import send_notification
+    from sqlalchemy import select as _select
+    try:
+        creator_result = await db.execute(_select(User).where(User.id == agent.creator_id))
+        creator = creator_result.scalar_one_or_none()
+        if not creator:
+            logger.warning(f"[Gateway] Cannot notify creator {agent.creator_id}: user not found")
+            return
+        await send_notification(
+            db,
+            user_id=agent.creator_id,
+            type="approval_pending",
+            title=f"[{agent.name}] tool approval: {approval.action_type}",
+            body=_json.dumps(approval.details, ensure_ascii=False)[:200],
+            link=f"/agents/{agent.id}#approvals",
+            ref_id=approval.id,
+        )
+    except Exception as e:
+        logger.warning(f"[Gateway] Failed to send approval notification: {e}")
+
+    # Feishu if channel configured
+    from sqlalchemy import select as _select
+    from app.models.channel_config import ChannelConfig
+    from app.services.feishu_service import feishu_service
+
+    channel_result = await db.execute(
+        _select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
+    )
+    channel = channel_result.scalars().first()
+
+    if channel and channel.app_id and channel.app_secret:
+        creator_result = await db.execute(_select(User).where(User.id == agent.creator_id))
+        creator = creator_result.scalar_one_or_none()
+        if creator:
+            from app.models.identity import IdentityProvider
+            from app.models.org import OrgMember
+
+            provider_r = await db.execute(
+                _select(IdentityProvider).where(
+                    IdentityProvider.provider_type == "feishu",
+                    IdentityProvider.tenant_id == creator.tenant_id,
+                )
+            )
+            provider = provider_r.scalar_one_or_none()
+            if provider:
+                member_r = await db.execute(
+                    _select(OrgMember).where(
+                        OrgMember.user_id == creator.id,
+                        OrgMember.provider_id == provider.id,
+                    )
+                )
+                member = member_r.scalar_one_or_none()
+                if member and (member.external_id or member.open_id):
+                    receive_id = member.external_id or member.open_id
+                    id_type = "user_id" if member.external_id else "open_id"
+                    try:
+                        await feishu_service.send_approval_card(
+                            channel.app_id, channel.app_secret,
+                            receive_id,
+                            agent.name,
+                            approval.action_type,
+                            _json.dumps(approval.details, ensure_ascii=False),
+                            str(approval.id),
+                        )
+                    except Exception as e:
+                        logger.warning(f"[Gateway] Feishu approval card failed: {e}")
 
 
 # ─── Send message ───────────────────────────────────────

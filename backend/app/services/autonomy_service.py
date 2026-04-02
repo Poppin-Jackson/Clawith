@@ -136,15 +136,25 @@ class AutonomyService:
             body_text = json.dumps(approval.details, ensure_ascii=False)[:200]
             if execution_result:
                 body_text = f"Result: {execution_result}"
-            await send_notification(
-                db,
-                user_id=agent.creator_id,
-                type="approval_resolved",
-                title=f"[{agent.name}] {approval.action_type} — {status_label}",
-                body=body_text,
-                link=f"/agents/{agent.id}#approvals",
-                ref_id=approval.id,
+
+            # Verify creator exists in users table before notifying
+            creator_result = await db.execute(
+                select(User).where(User.id == agent.creator_id)
             )
+            creator_user = creator_result.scalar_one_or_none()
+            if creator_user:
+                try:
+                    await send_notification(
+                        db,
+                        user_id=agent.creator_id,
+                        type="approval_resolved",
+                        title=f"[{agent.name}] {approval.action_type} — {status_label}",
+                        body=body_text,
+                        link=f"/agents/{agent.id}#approvals",
+                        ref_id=approval.id,
+                    )
+                except Exception as e:
+                    logger.warning(f"[Autonomy] Failed to notify creator: {e}")
 
             # Also notify the user who requested the action (if different from creator)
             requested_by = approval.details.get("requested_by") if approval.details else None
@@ -152,17 +162,25 @@ class AutonomyService:
                 try:
                     requester_id = uuid.UUID(requested_by)
                     if requester_id != agent.creator_id:
-                        await send_notification(
-                            db,
-                            user_id=requester_id,
-                            type="approval_resolved",
-                            title=f"[{agent.name}] {approval.action_type} — {status_label}",
-                            body=body_text,
-                            link=f"/agents/{agent.id}#activityLog",
-                            ref_id=approval.id,
+                        # Verify requester exists before notifying
+                        requester_result = await db.execute(
+                            select(User).where(User.id == requester_id)
                         )
+                        requester_user = requester_result.scalar_one_or_none()
+                        if requester_user:
+                            await send_notification(
+                                db,
+                                user_id=requester_id,
+                                type="approval_resolved",
+                                title=f"[{agent.name}] {approval.action_type} — {status_label}",
+                                body=body_text,
+                                link=f"/agents/{agent.id}#activityLog",
+                                ref_id=approval.id,
+                            )
                 except (ValueError, AttributeError):
                     pass  # Invalid UUID, skip
+                except Exception as e:
+                    logger.warning(f"[Autonomy] Failed to notify requester: {e}")
 
         await db.flush()
         return approval
